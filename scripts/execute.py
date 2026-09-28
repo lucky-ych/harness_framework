@@ -3,13 +3,12 @@
 Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
 
 Usage:
-    python3 scripts/execute.py <phase-dir> [--push]
+    python3 scripts/execute.py <phase-dir> [--model MODEL] [--push]
 """
 
 import argparse
 import contextlib
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -53,18 +52,20 @@ def progress_indicator(label: str):
 class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
-    MAX_RETRIES = 3
+    MAX_ATTEMPTS = 3  # initial invocation + at most two corrections
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
 
-    def __init__(self, phase_dir_name: str, *, auto_push: bool = False):
+    def __init__(self, phase_dir_name: str, *, auto_push: bool = False,
+                 model: Optional[str] = None):
         self._root = str(ROOT)
         self._phases_dir = ROOT / "phases"
         self._phase_dir = self._phases_dir / phase_dir_name
         self._phase_dir_name = phase_dir_name
         self._top_index_file = self._phases_dir / "index.json"
         self._auto_push = auto_push
+        self._model = model
 
         if not self._phase_dir.is_dir():
             print(f"ERROR: {self._phase_dir} not found")
@@ -176,13 +177,13 @@ class StepExecutor:
 
     def _load_guardrails(self) -> str:
         sections = []
-        claude_md = ROOT / "CLAUDE.md"
-        if claude_md.exists():
-            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
+        agents_md = ROOT / "AGENTS.md"
+        if agents_md.exists():
+            sections.append(f"## 프로젝트 규칙 (AGENTS.md)\n\n{agents_md.read_text(encoding='utf-8')}")
         docs_dir = ROOT / "docs"
         if docs_dir.is_dir():
             for doc in sorted(docs_dir.glob("*.md")):
-                sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+                sections.append(f"## {doc.stem}\n\n{doc.read_text(encoding='utf-8')}")
         return "\n\n---\n\n".join(sections) if sections else ""
 
     @staticmethod
@@ -198,9 +199,6 @@ class StepExecutor:
 
     def _build_preamble(self, guardrails: str, step_context: str,
                         prev_error: Optional[str] = None) -> str:
-        commit_example = self.FEAT_MSG.format(
-            phase=self._phase_name, num="N", name="<step-name>"
-        )
         retry_section = ""
         if prev_error:
             retry_section = (
@@ -216,17 +214,17 @@ class StepExecutor:
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
             f"3. 기존 테스트를 깨뜨리지 마라.\n"
             f"4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
-            f"5. /phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
+            f"5. phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
             f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
-            f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
+            f"   - AC 실패 → \"error\" + \"error_message\"에 실제 실패 내용 기록\n"
             f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
-            f"6. 모든 변경사항을 커밋하라:\n"
-            f"   {commit_example}\n\n---\n\n"
+            f"6. 브랜치 전환과 커밋은 상위 executor가 담당한다. 직접 git commit/push 하지 마라.\n"
+            f"7. 다른 에이전트나 모델을 호출하지 말고 이 step만 직접 수행하라.\n\n---\n\n"
         )
 
-    # --- Claude 호출 ---
+    # --- Codex 호출 ---
 
-    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+    def _invoke_codex(self, step: dict, preamble: str) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
 
@@ -234,27 +232,53 @@ class StepExecutor:
             print(f"  ERROR: {step_file} not found")
             sys.exit(1)
 
-        prompt = preamble + step_file.read_text()
-        result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-            cwd=self._root, capture_output=True, text=True, timeout=1800,
-        )
+        prompt = preamble + step_file.read_text(encoding="utf-8")
+        cmd = ["codex", "exec", "--sandbox", "workspace-write", "--json",
+               "--cd", self._root, "-c", "approval_policy=never"]
+        if self._model:
+            cmd.extend(["--model", self._model])
+        cmd.append("-")
+        launch_error = False
+        try:
+            result = subprocess.run(
+                cmd, input=prompt, cwd=self._root, capture_output=True,
+                text=True, timeout=1800,
+            )
+            exit_code, stdout, stderr = result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
+            exit_code = None
+            stdout = self._as_text(exc.stdout)
+            stderr = self._as_text(exc.stderr)
+            stderr = f"Codex timed out after 1800 seconds.\n{stderr}".strip()
+        except OSError as exc:
+            exit_code = None
+            stdout = ""
+            stderr = f"Could not launch Codex CLI: {exc}. Install/authenticate Codex and retry."
+            launch_error = True
 
-        if result.returncode != 0:
-            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:500]}")
+        if exit_code is None or exit_code != 0:
+            print(f"\n  WARN: Codex 실행 실패 (code {exit_code})")
+            if stderr:
+                print(f"  stderr: {stderr[:500]}")
 
         output = {
             "step": step_num, "name": step_name,
-            "exitCode": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr,
+            "exitCode": exit_code,
+            "stdout": stdout, "stderr": stderr,
         }
+        if launch_error:
+            output["launchError"] = True
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
+
+    @staticmethod
+    def _as_text(value) -> str:
+        if value is None:
+            return ""
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
 
     # --- 헤더 & 검증 ---
 
@@ -268,7 +292,7 @@ class StepExecutor:
 
     def _check_blockers(self):
         index = self._read_json(self._index_file)
-        for s in reversed(index["steps"]):
+        for s in index["steps"]:
             if s["status"] == "error":
                 print(f"\n  ✗ Step {s['step']} ({s['name']}) failed.")
                 print(f"  Error: {s.get('error_message', 'unknown')}")
@@ -279,8 +303,6 @@ class StepExecutor:
                 print(f"  Reason: {s.get('blocked_reason', 'unknown')}")
                 print(f"  Resolve and reset status to 'pending' to retry.")
                 sys.exit(2)
-            if s["status"] != "pending":
-                break
 
     def _ensure_created_at(self):
         index = self._read_json(self._index_file)
@@ -296,24 +318,29 @@ class StepExecutor:
         done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
         prev_error = None
 
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
             index = self._read_json(self._index_file)
             step_context = self._build_step_context(index)
             preamble = self._build_preamble(guardrails, step_context, prev_error)
 
             tag = f"Step {step_num}/{self._total - 1} ({done} done): {step_name}"
             if attempt > 1:
-                tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
+                tag += f" [attempt {attempt}/{self.MAX_ATTEMPTS}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble)
-                elapsed = int(pi.elapsed)
+                output = self._invoke_codex(step, preamble)
+            elapsed = int(pi.elapsed)
+
+            if output.get("launchError"):
+                print(f"  ERROR: {output['stderr']}")
+                print("  현재 step은 pending 상태로 남겼습니다. 환경을 복구한 뒤 재실행하세요.")
+                sys.exit(1)
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
 
-            if status == "completed":
+            if status == "completed" and output["exitCode"] == 0:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["completed_at"] = ts
@@ -333,28 +360,33 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
-            err_msg = next(
-                (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
-                "Step did not update status",
-            )
+            step_state = next(s for s in index["steps"] if s["step"] == step_num)
+            err_msg = step_state.get("error_message") or "Step did not update status"
+            if output["exitCode"] != 0:
+                detail = output["stderr"].strip() or f"exit code {output['exitCode']}"
+                err_msg = f"Codex invocation failed ({detail[:500]}); step status: {status}"
 
-            if attempt < self.MAX_RETRIES:
+            if attempt < self.MAX_ATTEMPTS:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "pending"
                         s.pop("error_message", None)
+                        s.pop("summary", None)
+                        s.pop("completed_at", None)
                 self._write_json(self._index_file, index)
                 prev_error = err_msg
-                print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
+                print(f"  ↻ Step {step_num}: correction {attempt}/{self.MAX_ATTEMPTS - 1} — {err_msg}")
             else:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "error"
-                        s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
+                        s["error_message"] = f"[{self.MAX_ATTEMPTS}회 시도 후 실패] {err_msg}"
+                        s.pop("summary", None)
+                        s.pop("completed_at", None)
                         s["failed_at"] = ts
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
-                print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
+                print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_ATTEMPTS} attempts [{elapsed}s]")
                 print(f"    Error: {err_msg}")
                 self._update_top_index("error")
                 sys.exit(1)
@@ -363,6 +395,7 @@ class StepExecutor:
 
     def _execute_all_steps(self, guardrails: str):
         while True:
+            self._check_blockers()
             index = self._read_json(self._index_file)
             pending = next((s for s in index["steps"] if s["status"] == "pending"), None)
             if pending is None:
@@ -380,6 +413,10 @@ class StepExecutor:
 
     def _finalize(self):
         index = self._read_json(self._index_file)
+        self._check_blockers()
+        if any(s["status"] != "completed" for s in index["steps"]):
+            print("  ERROR: pending step이 남아 phase를 완료할 수 없습니다.")
+            sys.exit(1)
         index["completed_at"] = self._stamp()
         self._write_json(self._index_file, index)
         self._update_top_index("completed")
@@ -408,9 +445,10 @@ def main():
     parser = argparse.ArgumentParser(description="Harness Step Executor")
     parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
     parser.add_argument("--push", action="store_true", help="Push branch after completion")
+    parser.add_argument("--model", help="Override the configured Codex model for step runs")
     args = parser.parse_args()
 
-    StepExecutor(args.phase_dir, auto_push=args.push).run()
+    StepExecutor(args.phase_dir, auto_push=args.push, model=args.model).run()
 
 
 if __name__ == "__main__":

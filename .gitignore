@@ -7,3 +7,9 @@ tsconfig.tsbuildinfo
 # phase execution outputs
 phases/**/phase*-output.json
 phases/**/step*-output.json
+
+# Python development artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
