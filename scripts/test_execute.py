@@ -506,6 +506,59 @@ class TestStepLoop:
         step.update(status=status, **fields)
         executor._write_json(executor._index_file, index)
 
+    def test_missing_step_is_restored_before_retry(self, executor):
+        calls = []
+
+        def fake_invoke(step, preamble):
+            calls.append(preamble)
+            index = executor._read_json(executor._index_file)
+            if len(calls) == 1:
+                index["steps"] = []
+                executor._write_json(executor._index_file, index)
+            else:
+                assert [s["status"] for s in index["steps"]] == ["completed", "completed", "pending"]
+                assert [s["summary"] for s in index["steps"][:2]] == ["프로젝트 초기화 완료", "핵심 로직 구현"]
+                index["steps"][2].update(status="completed", summary="recovered")
+                executor._write_json(executor._index_file, index)
+            return {"exitCode": 0, "stdout": "", "stderr": ""}
+
+        with patch.object(executor, "_invoke_codex", side_effect=fake_invoke), patch.object(executor, "_commit_step") as commit:
+            assert executor._execute_single_step({"step": 2, "name": "ui", "status": "pending"}, "")
+
+        assert len(calls) == 2
+        assert "missing" in calls[1].lower()
+        final = executor._read_json(executor._index_file)["steps"]
+        assert [s["status"] for s in final] == ["completed", "completed", "completed"]
+        assert final[2]["summary"] == "recovered"
+        commit.assert_called_once_with(2, "ui")
+
+    def test_persistently_missing_step_becomes_error_without_dropping_completed_rows(self, executor, top_index):
+        calls = []
+
+        def fake_invoke(step, preamble):
+            calls.append(preamble)
+            index = executor._read_json(executor._index_file)
+            index["steps"] = []
+            executor._write_json(executor._index_file, index)
+            return {"exitCode": 0, "stdout": "", "stderr": ""}
+
+        with patch.object(executor, "_invoke_codex", side_effect=fake_invoke), patch.object(executor, "_commit_step") as commit:
+            with pytest.raises(SystemExit) as exc_info:
+                executor._execute_single_step({"step": 2, "name": "ui", "status": "pending"}, "")
+
+        assert exc_info.value.code == 1
+        assert len(calls) == executor.MAX_ATTEMPTS == 3
+        final = executor._read_json(executor._index_file)
+        assert [s["status"] for s in final["steps"]] == ["completed", "completed", "error"]
+        assert [s["summary"] for s in final["steps"][:2]] == ["프로젝트 초기화 완료", "핵심 로직 구현"]
+        assert "missing" in final["steps"][2]["error_message"].lower()
+        assert "failed_at" in final["steps"][2]
+        assert "completed_at" not in final
+        assert executor._read_json(top_index)["phases"][0]["status"] == "error"
+        commit.assert_called_once_with(2, "ui")
+        with pytest.raises(SystemExit):
+            executor._finalize()
+
     def test_completed_step_requires_clean_process_exit(self, executor):
         prompts = []
 

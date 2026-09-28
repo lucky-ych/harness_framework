@@ -320,6 +320,7 @@ class StepExecutor:
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             index = self._read_json(self._index_file)
+            previous_steps = index["steps"]
             step_context = self._build_step_context(index)
             preamble = self._build_preamble(guardrails, step_context, prev_error)
 
@@ -337,7 +338,18 @@ class StepExecutor:
                 sys.exit(1)
 
             index = self._read_json(self._index_file)
-            status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+            step_state = next((s for s in index["steps"] if s["step"] == step_num), None)
+            missing_step = step_state is None
+            if missing_step:
+                # A child may replace the whole list. Restore the pre-call snapshot so
+                # completed steps and this step's identity remain available for retry/error.
+                index["steps"] = previous_steps
+                step_state = next((s for s in previous_steps if s["step"] == step_num), None)
+                if step_state is None:
+                    step_state = dict(step)
+                    index["steps"].append(step_state)
+                self._write_json(self._index_file, index)
+            status = "pending" if missing_step else step_state.get("status", "pending")
             ts = self._stamp()
 
             if status == "completed" and output["exitCode"] == 0:
@@ -360,11 +372,14 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
-            step_state = next(s for s in index["steps"] if s["step"] == step_num)
-            err_msg = step_state.get("error_message") or "Step did not update status"
+            err_msg = (
+                f"Step {step_num} missing from phase index after Codex invocation; restored prior steps"
+                if missing_step else step_state.get("error_message") or "Step did not update status"
+            )
             if output["exitCode"] != 0:
                 detail = output["stderr"].strip() or f"exit code {output['exitCode']}"
-                err_msg = f"Codex invocation failed ({detail[:500]}); step status: {status}"
+                process_error = f"Codex invocation failed ({detail[:500]}); step status: {status}"
+                err_msg = f"{err_msg}; {process_error}" if missing_step else process_error
 
             if attempt < self.MAX_ATTEMPTS:
                 for s in index["steps"]:
