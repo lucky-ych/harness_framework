@@ -27,7 +27,7 @@
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest scripts/test_execute.py -q
+python3 -m pytest scripts/test_execute.py scripts/test_portable_skill.py -q
 ```
 
 ## 대상 애플리케이션 명령 예시

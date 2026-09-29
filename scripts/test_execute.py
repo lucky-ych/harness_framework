@@ -1,6 +1,7 @@
 """Codex step executor의 상태 전이와 프로세스 호출을 검증한다."""
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
@@ -9,7 +10,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "harness" / "scripts"))
 import execute as ex
 
 
@@ -72,8 +73,7 @@ def top_index(tmp_project):
 @pytest.fixture
 def executor(tmp_project, phase_dir):
     """테스트용 StepExecutor 인스턴스. git 호출은 별도 mock 필요."""
-    with patch.object(ex, "ROOT", tmp_project):
-        inst = ex.StepExecutor("0-mvp")
+    inst = ex.StepExecutor("0-mvp", project_root=tmp_project)
     # 내부 경로를 tmp_project 기준으로 재설정
     inst._root = str(tmp_project)
     inst._phases_dir = tmp_project / "phases"
@@ -142,49 +142,44 @@ class TestJsonHelpers:
 
 class TestLoadGuardrails:
     def test_loads_agents_md_and_docs(self, executor, tmp_project):
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+        result = executor._load_guardrails()
         assert "# Rules" in result
         assert "rule one" in result
         assert "# Architecture" in result
         assert "# Guide" in result
 
     def test_sections_separated_by_divider(self, executor, tmp_project):
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+        result = executor._load_guardrails()
         assert "---" in result
 
     def test_docs_sorted_alphabetically(self, executor, tmp_project):
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+        result = executor._load_guardrails()
         arch_pos = result.index("arch")
         guide_pos = result.index("guide")
         assert arch_pos < guide_pos
 
     def test_no_agents_md(self, executor, tmp_project):
         (tmp_project / "AGENTS.md").unlink()
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+        result = executor._load_guardrails()
         assert "AGENTS.md" not in result
         assert "Architecture" in result
 
     def test_no_docs_dir(self, executor, tmp_project):
         import shutil
         shutil.rmtree(tmp_project / "docs")
-        with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
+        result = executor._load_guardrails()
         assert "Rules" in result
         assert "Architecture" not in result
 
     def test_empty_project(self, tmp_path):
-        with patch.object(ex, "ROOT", tmp_path):
-            # executor가 필요 없는 static-like 동작이므로 임시 인스턴스
-            phases_dir = tmp_path / "phases" / "dummy"
-            phases_dir.mkdir(parents=True)
-            idx = {"project": "T", "phase": "t", "steps": []}
-            (phases_dir / "index.json").write_text(json.dumps(idx))
-            inst = ex.StepExecutor.__new__(ex.StepExecutor)
-            result = inst._load_guardrails()
+        # executor가 필요 없는 static-like 동작이므로 임시 인스턴스
+        phases_dir = tmp_path / "phases" / "dummy"
+        phases_dir.mkdir(parents=True)
+        idx = {"project": "T", "phase": "t", "steps": []}
+        (phases_dir / "index.json").write_text(json.dumps(idx))
+        inst = ex.StepExecutor.__new__(ex.StepExecutor)
+        inst._root_path = tmp_path
+        result = inst._load_guardrails()
         assert result == ""
 
 
@@ -694,24 +689,22 @@ class TestMainCli:
             assert exc_info.value.code == 2  # argparse exits with 2
 
     def test_invalid_phase_dir_exits(self):
-        with patch("sys.argv", ["execute.py", "nonexistent"]):
-            with patch.object(ex, "ROOT", Path("/tmp/fake_nonexistent")):
-                with pytest.raises(SystemExit) as exc_info:
-                    ex.main()
-                assert exc_info.value.code == 1
+        with patch("sys.argv", ["execute.py", "nonexistent", "--project-root", "/tmp/fake_nonexistent"]):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.main()
+            assert exc_info.value.code == 1
 
     def test_missing_index_exits(self, tmp_project):
         (tmp_project / "phases" / "empty").mkdir()
-        with patch("sys.argv", ["execute.py", "empty"]):
-            with patch.object(ex, "ROOT", tmp_project):
-                with pytest.raises(SystemExit) as exc_info:
-                    ex.main()
-                assert exc_info.value.code == 1
+        with patch("sys.argv", ["execute.py", "empty", "--project-root", str(tmp_project)]):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.main()
+            assert exc_info.value.code == 1
 
     def test_model_and_push_are_forwarded(self):
         with patch("sys.argv", ["execute.py", "0-mvp", "--model", "my-model", "--push"]), patch.object(ex, "StepExecutor") as cls:
             ex.main()
-        cls.assert_called_once_with("0-mvp", auto_push=True, model="my-model")
+        cls.assert_called_once_with("0-mvp", project_root=None, auto_push=True, model="my-model")
         cls.return_value.run.assert_called_once()
 
 
@@ -726,8 +719,8 @@ class TestCheckBlockers:
         index = {"project": "T", "phase": "test", "steps": steps}
         (d / "index.json").write_text(json.dumps(index))
 
-        with patch.object(ex, "ROOT", tmp_project):
-            inst = ex.StepExecutor.__new__(ex.StepExecutor)
+        inst = ex.StepExecutor.__new__(ex.StepExecutor)
+        inst._root_path = tmp_project
         inst._root = str(tmp_project)
         inst._phases_dir = tmp_project / "phases"
         inst._phase_dir = d
@@ -778,3 +771,99 @@ def test_finalize_rejects_pending_steps(executor):
     assert exc_info.value.code == 1
     git.assert_not_called()
     assert "completed_at" not in executor._read_json(executor._index_file)
+
+
+class TestManagedPathsAtPointOfUse:
+    def test_index_replaced_by_symlink_after_construction(self, executor, tmp_path):
+        victim = tmp_path / "victim.json"
+        victim.write_text('{"steps": []}')
+        executor._index_file.unlink()
+        executor._index_file.symlink_to(victim)
+        with pytest.raises(SystemExit) as exc:
+            executor._ensure_created_at()
+        assert exc.value.code == 1
+        assert victim.read_text() == '{"steps": []}'
+
+    def test_phases_dir_redirected_after_construction(self, executor, tmp_project, top_index, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "index.json").write_text(top_index.read_text())
+        before = (outside / "index.json").read_bytes()
+        import shutil
+        shutil.rmtree(tmp_project / "phases")
+        (tmp_project / "phases").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(SystemExit):
+            executor._update_top_index("completed")
+        assert (outside / "index.json").read_bytes() == before
+
+    def test_internal_alias_also_rejected(self, executor, tmp_project):
+        other = tmp_project / "other.json"
+        other.write_text("{}")
+        executor._top_index_file.symlink_to(other)
+        with pytest.raises(SystemExit):
+            executor._update_top_index("completed")
+        assert other.read_text() == "{}"
+
+
+class TestCorrection2Boundaries:
+    def test_dotdot_path_under_root_cannot_escape(self, executor, tmp_project):
+        outside = tmp_project.parent / "outside-dotdot.json"
+        outside.write_text('{"k": 1}')
+        sneaky = tmp_project / ".." / "outside-dotdot.json"
+        with pytest.raises(SystemExit):
+            executor._save(sneaky, {"k": 2})
+        with pytest.raises(SystemExit):
+            executor._load(sneaky)
+        assert outside.read_text() == '{"k": 1}'
+
+    @pytest.mark.parametrize("bad", ["../x", "1/../..", True, -1, "0", 1.5, None])
+    def test_malformed_step_id_rejected_before_any_path_use(self, tmp_project, phase_dir, bad, tmp_path):
+        idx = json.loads((phase_dir / "index.json").read_text())
+        idx["steps"][0]["step"] = bad
+        (phase_dir / "index.json").write_text(json.dumps(idx))
+        with pytest.raises(SystemExit) as exc:
+            ex.StepExecutor("0-mvp", project_root=tmp_project)
+        assert exc.value.code == 1
+
+    def test_malformed_step_id_injected_later_never_invokes_codex(self, executor):
+        idx = json.loads(executor._index_file.read_text())
+        idx["steps"][0]["step"] = "../../evil"
+        executor._index_file.write_text(json.dumps(idx))
+        with patch.object(executor, "_invoke_codex") as inv, pytest.raises(SystemExit) as exc:
+            executor._execute_all_steps("")
+        assert exc.value.code == 1
+        inv.assert_not_called()
+
+    def test_agents_md_symlink_rejected(self, executor, tmp_project, tmp_path):
+        marker = tmp_path / "marker.md"
+        marker.write_text("EXTERNAL-MARKER")
+        (tmp_project / "AGENTS.md").unlink()
+        (tmp_project / "AGENTS.md").symlink_to(marker)
+        with pytest.raises(SystemExit):
+            executor._load_guardrails()
+
+    def test_docs_dir_symlink_rejected(self, executor, tmp_project, tmp_path):
+        outside = tmp_path / "outdocs"
+        outside.mkdir()
+        (outside / "x.md").write_text("EXTERNAL-MARKER")
+        import shutil
+        shutil.rmtree(tmp_project / "docs")
+        (tmp_project / "docs").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(SystemExit):
+            executor._load_guardrails()
+
+    def test_docs_markdown_symlink_rejected(self, executor, tmp_project, tmp_path):
+        marker = tmp_path / "marker.md"
+        marker.write_text("EXTERNAL-MARKER")
+        (tmp_project / "docs" / "NOTES.md").symlink_to(marker)
+        with pytest.raises(SystemExit):
+            executor._load_guardrails()
+
+    def test_nonregular_markdown_rejected_without_blocking(self, executor, tmp_project):
+        os.mkfifo(tmp_project / "docs" / "pipe.md")
+        with pytest.raises(SystemExit):
+            executor._load_guardrails()
+
+    def test_regular_docs_still_load(self, executor):
+        out = executor._load_guardrails()
+        assert "rule one" in out and "Architecture" in out

@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""
+Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
+
+Usage:
+    python3 <skill-dir>/scripts/execute.py <phase-dir> [--project-root DIR] [--model MODEL] [--push]
+
+The target project root is --project-root (default: current directory). It is never
+inferred from this script's install location. It must be the Git working-tree root.
+"""
+
+import argparse
+import contextlib
+import json
+import re
+import subprocess
+import sys
+import threading
+import time
+import types
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
+PHASE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+@contextlib.contextmanager
+def progress_indicator(label: str):
+    """터미널 진행 표시기. with 문으로 사용하며 .elapsed 로 경과 시간을 읽는다."""
+    frames = "◐◓◑◒"
+    stop = threading.Event()
+    t0 = time.monotonic()
+
+    def _animate():
+        idx = 0
+        while not stop.wait(0.12):
+            sec = int(time.monotonic() - t0)
+            sys.stderr.write(f"\r{frames[idx % len(frames)]} {label} [{sec}s]")
+            sys.stderr.flush()
+            idx += 1
+        sys.stderr.write("\r" + " " * (len(label) + 20) + "\r")
+        sys.stderr.flush()
+
+    th = threading.Thread(target=_animate, daemon=True)
+    th.start()
+    info = types.SimpleNamespace(elapsed=0.0)
+    try:
+        yield info
+    finally:
+        stop.set()
+        th.join()
+        info.elapsed = time.monotonic() - t0
+
+
+class StepExecutor:
+    """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
+
+    MAX_ATTEMPTS = 3  # initial invocation + at most two corrections
+    FEAT_MSG = "feat({phase}): step {num} — {name}"
+    CHORE_MSG = "chore({phase}): step {num} output"
+    TZ = timezone(timedelta(hours=9))
+
+    def __init__(self, phase_dir_name: str, *, project_root=None,
+                 auto_push: bool = False, model: Optional[str] = None):
+        root = Path(project_root) if project_root is not None else Path.cwd()
+        if not root.is_dir():
+            print(f"ERROR: project root {root} is not a directory")
+            sys.exit(1)
+        self._root_path = root.resolve()
+        self._root = str(self._root_path)
+        if (not PHASE_NAME_RE.fullmatch(phase_dir_name)
+                or phase_dir_name in (".", "..")):
+            print(f"ERROR: invalid phase directory name '{phase_dir_name}' "
+                  "(single relative name without path separators required)")
+            sys.exit(1)
+        self._phases_dir = self._root_path / "phases"
+        self._phase_dir = self._phases_dir / phase_dir_name
+        self._phase_dir_name = phase_dir_name
+        self._top_index_file = self._phases_dir / "index.json"
+        self._auto_push = auto_push
+        self._model = model
+
+        self._index_file = self._phase_dir / "index.json"
+        for managed in (self._phases_dir, self._phase_dir, self._index_file,
+                        self._top_index_file):
+            self._ensure_managed(managed)
+
+        if not self._phase_dir.is_dir():
+            print(f"ERROR: {self._phase_dir} not found")
+            sys.exit(1)
+
+        if not self._index_file.exists():
+            print(f"ERROR: {self._index_file} not found")
+            sys.exit(1)
+
+        idx = self._load(self._index_file)
+        self._project = idx.get("project", "project")
+        self._phase_name = idx.get("phase", phase_dir_name)
+        self._check_step_ids(idx)
+        self._total = len(idx["steps"])
+
+    def _ensure_managed(self, path: Path):
+        """관리 경로가 대상 프로젝트 안에 있고 '..'·심볼릭 링크(끊긴 링크 포함)가 없는지 검사한다."""
+        path = Path(path)
+        if ".." in path.parts:
+            print(f"ERROR: managed path {path} contains '..'; refusing to use it")
+            sys.exit(1)
+        try:
+            rel = path.relative_to(self._root_path)
+            path.resolve().relative_to(self._root_path)
+        except ValueError:
+            print(f"ERROR: {path} is outside project root {self._root_path}")
+            sys.exit(1)
+        cur = self._root_path
+        for part in rel.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                print(f"ERROR: managed path {cur} is a symlink; refusing to use it")
+                sys.exit(1)
+
+    def _check_boundary(self):
+        """phase/최상위 index 경로가 체크아웃이나 자식 실행 뒤에도 안전한지 다시 확인한다."""
+        for p in (self._phases_dir, self._phase_dir, self._index_file, self._top_index_file):
+            self._ensure_managed(p)
+
+    @staticmethod
+    def _valid_step_id(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    def _check_step_ids(self, index: dict):
+        for s in index.get("steps", []):
+            if not isinstance(s, dict) or not self._valid_step_id(s.get("step")):
+                bad = s.get("step") if isinstance(s, dict) else s
+                print(f"ERROR: invalid step id {bad!r} in {self._index_file} (non-negative integer required)")
+                sys.exit(1)
+
+    def _load(self, p: Path) -> dict:
+        self._ensure_managed(p)
+        return self._read_json(p)
+
+    def _save(self, p: Path, data: dict):
+        self._ensure_managed(p)
+        self._write_json(p, data)
+
+    def _verify_git_root(self):
+        r = self._run_git("rev-parse", "--show-toplevel")
+        top = r.stdout.strip() if r.returncode == 0 else ""
+        if not top or Path(top).resolve() != self._root_path:
+            print(f"ERROR: {self._root_path} is not the Git working-tree root"
+                  + (f" (found {top})" if top else " (not a Git repository)"))
+            print("  --project-root에 대상 프로젝트의 Git 루트를 지정하세요.")
+            sys.exit(1)
+
+    def run(self):
+        self._verify_git_root()
+        self._print_header()
+        self._check_blockers()
+        self._checkout_branch()
+        self._check_boundary()
+        guardrails = self._load_guardrails()
+        self._ensure_created_at()
+        self._execute_all_steps(guardrails)
+        self._finalize()
+
+    # --- timestamps ---
+
+    def _stamp(self) -> str:
+        return datetime.now(self.TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    # --- JSON I/O ---
+
+    @staticmethod
+    def _read_json(p: Path) -> dict:
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _write_json(p: Path, data: dict):
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # --- git ---
+
+    def _run_git(self, *args) -> subprocess.CompletedProcess:
+        cmd = ["git"] + list(args)
+        return subprocess.run(cmd, cwd=self._root, capture_output=True, text=True)
+
+    def _checkout_branch(self):
+        branch = f"feat-{self._phase_name}"
+
+        r = self._run_git("rev-parse", "--abbrev-ref", "HEAD")
+        if r.returncode != 0:
+            print(f"  ERROR: git을 사용할 수 없거나 git repo가 아닙니다.")
+            print(f"  {r.stderr.strip()}")
+            sys.exit(1)
+
+        if r.stdout.strip() == branch:
+            return
+
+        r = self._run_git("rev-parse", "--verify", branch)
+        r = self._run_git("checkout", branch) if r.returncode == 0 else self._run_git("checkout", "-b", branch)
+
+        if r.returncode != 0:
+            print(f"  ERROR: 브랜치 '{branch}' checkout 실패.")
+            print(f"  {r.stderr.strip()}")
+            print(f"  Hint: 변경사항을 stash하거나 commit한 후 다시 시도하세요.")
+            sys.exit(1)
+
+        print(f"  Branch: {branch}")
+
+    def _commit_step(self, step_num: int, step_name: str):
+        output_rel = f"phases/{self._phase_dir_name}/step{step_num}-output.json"
+        index_rel = f"phases/{self._phase_dir_name}/index.json"
+
+        self._run_git("add", "-A")
+        self._run_git("reset", "HEAD", "--", output_rel)
+        self._run_git("reset", "HEAD", "--", index_rel)
+
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            msg = self.FEAT_MSG.format(phase=self._phase_name, num=step_num, name=step_name)
+            r = self._run_git("commit", "-m", msg)
+            if r.returncode == 0:
+                print(f"  Commit: {msg}")
+            else:
+                print(f"  WARN: 코드 커밋 실패: {r.stderr.strip()}")
+
+        self._run_git("add", "-A")
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            msg = self.CHORE_MSG.format(phase=self._phase_name, num=step_num)
+            r = self._run_git("commit", "-m", msg)
+            if r.returncode != 0:
+                print(f"  WARN: housekeeping 커밋 실패: {r.stderr.strip()}")
+
+    # --- top-level index ---
+
+    def _update_top_index(self, status: str):
+        self._ensure_managed(self._top_index_file)
+        if not self._top_index_file.exists():
+            return
+        top = self._load(self._top_index_file)
+        ts = self._stamp()
+        for phase in top.get("phases", []):
+            if phase.get("dir") == self._phase_dir_name:
+                phase["status"] = status
+                ts_key = {"completed": "completed_at", "error": "failed_at", "blocked": "blocked_at"}.get(status)
+                if ts_key:
+                    phase[ts_key] = ts
+                break
+        self._save(self._top_index_file, top)
+
+    # --- guardrails & context ---
+
+    def _read_guardrail(self, path: Path):
+        """관리 경로 검사를 통과한 일반 파일만 읽는다. 없으면 None."""
+        self._ensure_managed(path)
+        if not path.exists():
+            return None
+        if not path.is_file():
+            print(f"ERROR: {path} is not a regular file; refusing to load it")
+            sys.exit(1)
+        return path.read_text(encoding="utf-8")
+
+    def _load_guardrails(self) -> str:
+        sections = []
+        text = self._read_guardrail(self._root_path / "AGENTS.md")
+        if text is not None:
+            sections.append(f"## 프로젝트 규칙 (AGENTS.md)\n\n{text}")
+        docs_dir = self._root_path / "docs"
+        self._ensure_managed(docs_dir)
+        if docs_dir.is_dir():
+            for doc in sorted(docs_dir.glob("*.md")):
+                sections.append(f"## {doc.stem}\n\n{self._read_guardrail(doc)}")
+        return "\n\n---\n\n".join(sections) if sections else ""
+
+    @staticmethod
+    def _build_step_context(index: dict) -> str:
+        lines = [
+            f"- Step {s['step']} ({s['name']}): {s['summary']}"
+            for s in index["steps"]
+            if s["status"] == "completed" and s.get("summary")
+        ]
+        if not lines:
+            return ""
+        return "## 이전 Step 산출물\n\n" + "\n".join(lines) + "\n\n"
+
+    def _build_preamble(self, guardrails: str, step_context: str,
+                        prev_error: Optional[str] = None) -> str:
+        retry_section = ""
+        if prev_error:
+            retry_section = (
+                f"\n## ⚠ 이전 시도 실패 — 아래 에러를 반드시 참고하여 수정하라\n\n"
+                f"{prev_error}\n\n---\n\n"
+            )
+        return (
+            f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
+            f"{guardrails}\n\n---\n\n"
+            f"{step_context}{retry_section}"
+            f"## 작업 규칙\n\n"
+            f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
+            f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
+            f"3. 기존 테스트를 깨뜨리지 마라.\n"
+            f"4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
+            f"5. phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
+            f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
+            f"   - AC 실패 → \"error\" + \"error_message\"에 실제 실패 내용 기록\n"
+            f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
+            f"6. 브랜치 전환과 커밋은 상위 executor가 담당한다. 직접 git commit/push 하지 마라.\n"
+            f"7. 다른 에이전트나 모델을 호출하지 말고 이 step만 직접 수행하라.\n\n---\n\n"
+        )
+
+    # --- Codex 호출 ---
+
+    def _invoke_codex(self, step: dict, preamble: str) -> dict:
+        step_num, step_name = step["step"], step["name"]
+        step_file = self._phase_dir / f"step{step_num}.md"
+
+        if not step_file.exists():
+            print(f"  ERROR: {step_file} not found")
+            sys.exit(1)
+
+        self._ensure_managed(step_file)
+        prompt = preamble + step_file.read_text(encoding="utf-8")
+        cmd = ["codex", "exec", "--sandbox", "workspace-write", "--json",
+               "--cd", self._root, "-c", "approval_policy=never"]
+        if self._model:
+            cmd.extend(["--model", self._model])
+        cmd.append("-")
+        launch_error = False
+        try:
+            result = subprocess.run(
+                cmd, input=prompt, cwd=self._root, capture_output=True,
+                text=True, timeout=1800,
+            )
+            exit_code, stdout, stderr = result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
+            exit_code = None
+            stdout = self._as_text(exc.stdout)
+            stderr = self._as_text(exc.stderr)
+            stderr = f"Codex timed out after 1800 seconds.\n{stderr}".strip()
+        except OSError as exc:
+            exit_code = None
+            stdout = ""
+            stderr = f"Could not launch Codex CLI: {exc}. Install/authenticate Codex and retry."
+            launch_error = True
+
+        if exit_code is None or exit_code != 0:
+            print(f"\n  WARN: Codex 실행 실패 (code {exit_code})")
+            if stderr:
+                print(f"  stderr: {stderr[:500]}")
+
+        output = {
+            "step": step_num, "name": step_name,
+            "exitCode": exit_code,
+            "stdout": stdout, "stderr": stderr,
+        }
+        if launch_error:
+            output["launchError"] = True
+        out_path = self._phase_dir / f"step{step_num}-output.json"
+        self._ensure_managed(out_path)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+
+        return output
+
+    @staticmethod
+    def _as_text(value) -> str:
+        if value is None:
+            return ""
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+    # --- 헤더 & 검증 ---
+
+    def _print_header(self):
+        print(f"\n{'='*60}")
+        print(f"  Harness Step Executor")
+        print(f"  Phase: {self._phase_name} | Steps: {self._total}")
+        if self._auto_push:
+            print(f"  Auto-push: enabled")
+        print(f"{'='*60}")
+
+    def _check_blockers(self):
+        index = self._load(self._index_file)
+        for s in index["steps"]:
+            if s["status"] == "error":
+                print(f"\n  ✗ Step {s['step']} ({s['name']}) failed.")
+                print(f"  Error: {s.get('error_message', 'unknown')}")
+                print(f"  Fix and reset status to 'pending' to retry.")
+                sys.exit(1)
+            if s["status"] == "blocked":
+                print(f"\n  ⏸ Step {s['step']} ({s['name']}) blocked.")
+                print(f"  Reason: {s.get('blocked_reason', 'unknown')}")
+                print(f"  Resolve and reset status to 'pending' to retry.")
+                sys.exit(2)
+
+    def _ensure_created_at(self):
+        index = self._load(self._index_file)
+        if "created_at" not in index:
+            index["created_at"] = self._stamp()
+            self._save(self._index_file, index)
+
+    # --- 실행 루프 ---
+
+    def _execute_single_step(self, step: dict, guardrails: str) -> bool:
+        """단일 step 실행 (재시도 포함). 완료되면 True, 실패/차단이면 False."""
+        step_num, step_name = step["step"], step["name"]
+        done = sum(1 for s in self._load(self._index_file)["steps"] if s["status"] == "completed")
+        prev_error = None
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            index = self._load(self._index_file)
+            previous_steps = index["steps"]
+            step_context = self._build_step_context(index)
+            preamble = self._build_preamble(guardrails, step_context, prev_error)
+
+            tag = f"Step {step_num}/{self._total - 1} ({done} done): {step_name}"
+            if attempt > 1:
+                tag += f" [attempt {attempt}/{self.MAX_ATTEMPTS}]"
+
+            with progress_indicator(tag) as pi:
+                output = self._invoke_codex(step, preamble)
+            elapsed = int(pi.elapsed)
+            self._check_boundary()
+
+            if output.get("launchError"):
+                print(f"  ERROR: {output['stderr']}")
+                print("  현재 step은 pending 상태로 남겼습니다. 환경을 복구한 뒤 재실행하세요.")
+                sys.exit(1)
+
+            index = self._load(self._index_file)
+            step_state = next((s for s in index["steps"] if s["step"] == step_num), None)
+            missing_step = step_state is None
+            if missing_step:
+                # A child may replace the whole list. Restore the pre-call snapshot so
+                # completed steps and this step's identity remain available for retry/error.
+                index["steps"] = previous_steps
+                step_state = next((s for s in previous_steps if s["step"] == step_num), None)
+                if step_state is None:
+                    step_state = dict(step)
+                    index["steps"].append(step_state)
+                self._save(self._index_file, index)
+            status = "pending" if missing_step else step_state.get("status", "pending")
+            ts = self._stamp()
+
+            if status == "completed" and output["exitCode"] == 0:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["completed_at"] = ts
+                self._save(self._index_file, index)
+                self._commit_step(step_num, step_name)
+                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                return True
+
+            if status == "blocked":
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["blocked_at"] = ts
+                self._save(self._index_file, index)
+                reason = next((s.get("blocked_reason", "") for s in index["steps"] if s["step"] == step_num), "")
+                print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
+                print(f"    Reason: {reason}")
+                self._update_top_index("blocked")
+                sys.exit(2)
+
+            err_msg = (
+                f"Step {step_num} missing from phase index after Codex invocation; restored prior steps"
+                if missing_step else step_state.get("error_message") or "Step did not update status"
+            )
+            if output["exitCode"] != 0:
+                detail = output["stderr"].strip() or f"exit code {output['exitCode']}"
+                process_error = f"Codex invocation failed ({detail[:500]}); step status: {status}"
+                err_msg = f"{err_msg}; {process_error}" if missing_step else process_error
+
+            if attempt < self.MAX_ATTEMPTS:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "pending"
+                        s.pop("error_message", None)
+                        s.pop("summary", None)
+                        s.pop("completed_at", None)
+                self._save(self._index_file, index)
+                prev_error = err_msg
+                print(f"  ↻ Step {step_num}: correction {attempt}/{self.MAX_ATTEMPTS - 1} — {err_msg}")
+            else:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "error"
+                        s["error_message"] = f"[{self.MAX_ATTEMPTS}회 시도 후 실패] {err_msg}"
+                        s.pop("summary", None)
+                        s.pop("completed_at", None)
+                        s["failed_at"] = ts
+                self._save(self._index_file, index)
+                self._commit_step(step_num, step_name)
+                print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_ATTEMPTS} attempts [{elapsed}s]")
+                print(f"    Error: {err_msg}")
+                self._update_top_index("error")
+                sys.exit(1)
+
+        return False  # unreachable
+
+    def _execute_all_steps(self, guardrails: str):
+        while True:
+            self._check_blockers()
+            index = self._load(self._index_file)
+            pending = next((s for s in index["steps"] if s["status"] == "pending"), None)
+            if pending is None:
+                print("\n  All steps completed!")
+                return
+
+            self._check_step_ids(index)
+            step_num = pending["step"]
+            for s in index["steps"]:
+                if s["step"] == step_num and "started_at" not in s:
+                    s["started_at"] = self._stamp()
+                    self._save(self._index_file, index)
+                    break
+
+            self._execute_single_step(pending, guardrails)
+
+    def _finalize(self):
+        index = self._load(self._index_file)
+        self._check_blockers()
+        if any(s["status"] != "completed" for s in index["steps"]):
+            print("  ERROR: pending step이 남아 phase를 완료할 수 없습니다.")
+            sys.exit(1)
+        index["completed_at"] = self._stamp()
+        self._save(self._index_file, index)
+        self._update_top_index("completed")
+
+        self._run_git("add", "-A")
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            msg = f"chore({self._phase_name}): mark phase completed"
+            r = self._run_git("commit", "-m", msg)
+            if r.returncode == 0:
+                print(f"  ✓ {msg}")
+
+        if self._auto_push:
+            branch = f"feat-{self._phase_name}"
+            r = self._run_git("push", "-u", "origin", branch)
+            if r.returncode != 0:
+                print(f"\n  ERROR: git push 실패: {r.stderr.strip()}")
+                sys.exit(1)
+            print(f"  ✓ Pushed to origin/{branch}")
+
+        print(f"\n{'='*60}")
+        print(f"  Phase '{self._phase_name}' completed!")
+        print(f"{'='*60}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Harness Step Executor")
+    parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
+    parser.add_argument("--project-root", default=None,
+                        help="Target project Git root (default: current directory)")
+    parser.add_argument("--push", action="store_true", help="Push branch after completion")
+    parser.add_argument("--model", help="Override the configured Codex model for step runs")
+    args = parser.parse_args()
+
+    StepExecutor(args.phase_dir, project_root=args.project_root, auto_push=args.push, model=args.model).run()
+
+
+if __name__ == "__main__":
+    main()
